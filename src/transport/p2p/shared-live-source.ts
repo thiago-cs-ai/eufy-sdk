@@ -397,6 +397,7 @@ export class SharedLiveSource {
   private readonly warmDeadlineTimer = new Timer();
   private warmAttempts = 0;
   /** Battery budget timer + post-notice grace timer (battery/solar sources only). */
+  private pendingBudget?: { notice: StreamBudgetNotice; deadline: number };
   private readonly budgetTimer = new Timer();
   private readonly budgetGraceTimer = new Timer();
 
@@ -466,6 +467,7 @@ export class SharedLiveSource {
     return { consumer, buffered: this.bufferedMedia(seconds) };
   }
 
+  /** A warm join replays an outstanding budget on the next turn, after async callers can subscribe. */
   private attachConsumer(waitForKeyframe: boolean): Consumer {
     if (this.disposed) throw new Error("SharedLiveSource is disposed");
     const wasEmpty = this.consumers.size === 0;
@@ -485,6 +487,13 @@ export class SharedLiveSource {
     if (!this.stream) this.warm();
     else this.watchReusedStream();
 
+    const pending = this.pendingBudget;
+    if (pending) {
+      setImmediate(() => {
+        const graceMs = Math.ceil(pending.deadline - performance.now());
+        if (this.pendingBudget === pending && graceMs > 0) consumer.budget({ graceMs, extend: pending.notice.extend });
+      });
+    }
     return consumer;
   }
 
@@ -645,6 +654,7 @@ export class SharedLiveSource {
   }
 
   private clearBudget(): void {
+    this.pendingBudget = undefined;
     this.budgetTimer.cancel();
     this.budgetGraceTimer.cancel();
   }
@@ -664,7 +674,14 @@ export class SharedLiveSource {
       for (const c of [...this.consumers]) c.end();
       this.teardown("stopped");
     });
-    const notice: StreamBudgetNotice = { graceMs: this.budgetGraceMs, extend: (ms) => this.extendBudget(ms) };
+    const deadline = performance.now() + this.budgetGraceMs;
+    const notice: StreamBudgetNotice = {
+      graceMs: this.budgetGraceMs,
+      extend: (ms) => {
+        if (this.pendingBudget?.notice === notice && performance.now() < deadline) this.extendBudget(ms);
+      },
+    };
+    this.pendingBudget = { notice, deadline };
     for (const c of [...this.consumers]) c.budget(notice);
   }
 

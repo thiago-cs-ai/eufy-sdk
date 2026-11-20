@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { H264, H265, unit } from "./live-source-fixtures.js";
 import { SharedLiveSource, type SharedLiveSourceOptions } from "../shared-live-source.js";
-import type { LiveAudioFrame, LiveStreamHandle, LiveVideoFrame } from "../../../core/contracts.js";
+import type { LiveAudioFrame, LiveStreamHandle, LiveVideoFrame, StreamBudgetNotice } from "../../../core/contracts.js";
 
 /** Fake LiveStream: counts start/stop/nudge, lets a test push video/audio + emit stop/error. */
 class FakeStream extends EventEmitter implements LiveStreamHandle {
@@ -365,6 +365,48 @@ describe("SharedLiveSource", () => {
     expect(notices).toBe(1);
     vi.advanceTimersByTime(1);
     expect(notices).toBe(2);
+  });
+
+  it.each([false, true])("can renew during linger when expiry preceded detach: %s", async (expireBeforeDetach) => {
+    const { source, streams, last } = mk({ powered: "battery", batteryBudgetMs: 100, budgetGraceMs: 50 });
+    const viewer = source.attach();
+    last().video(frame(true));
+    vi.advanceTimersByTime(expireBeforeDetach ? 110 : 90);
+    viewer.stop();
+    vi.advanceTimersByTime(expireBeforeDetach ? 10 : 30);
+
+    const recorder = await Promise.resolve(source.attach());
+    const renew = vi.fn<(notice: StreamBudgetNotice) => void>().mockImplementationOnce((notice) => notice.extend());
+    recorder.on("budget", renew);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(renew).toHaveBeenCalledTimes(1);
+    expect(renew.mock.calls[0][0].graceMs).toBe(30);
+    vi.advanceTimersByTime(30);
+    expect(streams).toHaveLength(1);
+    expect(last().stopped).toBe(0);
+    vi.advanceTimersByTime(120);
+    expect(last().stopped).toBe(1);
+  });
+
+  it.each([false, true])("ignores a superseded notice inside its original grace (replaced pull: %s)", (replace) => {
+    const { source, last } = mk({ powered: "battery", batteryBudgetMs: 20, budgetGraceMs: 50 });
+    const viewer = source.attach();
+    let old: StreamBudgetNotice | undefined;
+    viewer.on("budget", (notice) => (old ??= notice));
+    last().video(frame(true));
+    vi.advanceTimersByTime(20);
+    if (replace) {
+      last().stop();
+      viewer.stop();
+      source.attach();
+      last().video(frame(true));
+    } else {
+      old!.extend();
+    }
+    vi.advanceTimersByTime(20);
+    old!.extend(1000);
+    vi.advanceTimersByTime(50);
+    expect(last().stopped).toBe(1);
   });
 
   it("extend() re-pushes the battery budget and cancels the auto-stop", () => {
